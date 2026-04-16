@@ -24,6 +24,41 @@ from PIL import Image, ImageDraw, ImageFont
 # Helpers
 # ---------------------------------------------------------------------------
 
+# Font paths tried in order for drawtext / Pillow rendering
+_FONT_CANDIDATES = [
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+]
+
+
+def _find_font() -> str | None:
+    for p in _FONT_CANDIDATES:
+        if Path(p).exists():
+            return p
+    return None
+
+
+def _clip_duration(path: Path) -> float:
+    """Return clip duration in seconds via ffprobe."""
+    result = subprocess.run(
+        ["ffprobe", "-v", "error",
+         "-show_entries", "format=duration",
+         "-of", "default=noprint_wrappers=1:nokey=1",
+         str(path)],
+        capture_output=True, text=True,
+    )
+    try:
+        return float(result.stdout.strip())
+    except ValueError:
+        return 0.0
+
+
+def _esc_drawtext(text: str) -> str:
+    """Escape a string for use inside an FFmpeg drawtext filter value."""
+    return text.replace("\\", "\\\\").replace("'", "\\'").replace(":", "\\:")
+
+
 def _run(cmd: list[str], env: dict | None = None) -> tuple[bool, str]:
     """Run a subprocess. Returns (success, stderr_or_stdout)."""
     result = subprocess.run(
@@ -114,18 +149,13 @@ def _step3_overlay_image(
 
     # Try to load a system font; fall back to Pillow's default bitmap font
     font_title = font_body = None
-    for font_path in [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-        "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
-    ]:
-        if Path(font_path).exists():
-            try:
-                font_title = ImageFont.truetype(font_path, 36)
-                font_body  = ImageFont.truetype(font_path, 24)
-            except OSError:
-                pass
-            break
+    font_path = _find_font()
+    if font_path:
+        try:
+            font_title = ImageFont.truetype(font_path, 36)
+            font_body  = ImageFont.truetype(font_path, 24)
+        except OSError:
+            pass
 
     draw.text((40, 30), project_name, fill="white", font=font_title)
     for i, clip in enumerate(clips):
@@ -155,17 +185,44 @@ def _step4_compose_menu(
 
 
 def _step5_encode_clips(
-    clips: list[dict], clips_dir: Path, dvd_clips_dir: Path
+    clips: list[dict],
+    clips_dir: Path,
+    dvd_clips_dir: Path,
+    fade_duration: float = 0.0,
 ) -> tuple[bool, list[Path], str]:
-    """Re-encode clips to DVD-compliant MPEG-2, skipping ones that already are."""
+    """Re-encode clips to DVD-compliant MPEG-2.
+
+    If fade_duration > 0 each clip gets a fade-in at the start and a
+    fade-out at the end (audio and video).  Fades force a full re-encode
+    even for clips that are already MPEG-2.
+    """
     dvd_clips_dir.mkdir(parents=True, exist_ok=True)
     encoded: list[Path] = []
     for clip in clips:
         src = clips_dir / clip["filename"]
         dst = dvd_clips_dir / f"{clip['id']}.mpg"
 
-        if _is_mpeg2(src):
-            # Already MPEG-2: just copy with a container change
+        if fade_duration > 0:
+            dur = _clip_duration(src)
+            fade_out_start = max(0.0, dur - fade_duration)
+            vf = (
+                f"scale=720:480,"
+                f"fade=t=in:st=0:d={fade_duration},"
+                f"fade=t=out:st={fade_out_start}:d={fade_duration}"
+            )
+            af = (
+                f"afade=t=in:st=0:d={fade_duration},"
+                f"afade=t=out:st={fade_out_start}:d={fade_duration}"
+            )
+            ok, err = _run([
+                "ffmpeg", "-y", "-i", str(src),
+                "-vf", vf, "-af", af,
+                "-r", "29.97",
+                "-c:v", "mpeg2video", "-b:v", "5000k",
+                "-c:a", "ac3", "-ar", "48000",
+                str(dst),
+            ])
+        elif _is_mpeg2(src):
             ok, err = _run([
                 "ffmpeg", "-y", "-i", str(src),
                 "-c:v", "copy", "-c:a", "ac3", "-ar", "48000",
@@ -185,19 +242,85 @@ def _step5_encode_clips(
     return True, encoded, ""
 
 
+def _step5b_generate_title_cards(
+    clips: list[dict],
+    dvd_clips_dir: Path,
+    title_duration: float = 3.0,
+    fade_duration: float = 0.5,
+) -> tuple[bool, dict[str, Path], str]:
+    """Generate a black title-card MPG for each clip using FFmpeg drawtext.
+
+    Returns (success, {clip_id: Path}, stderr_on_failure).
+    The chapter marker is placed on the title card, so DVD navigation lands
+    there first before the clip content plays.
+    """
+    dvd_clips_dir.mkdir(parents=True, exist_ok=True)
+    font = _find_font()
+    fade_out_start = max(0.0, title_duration - fade_duration)
+    paths: dict[str, Path] = {}
+
+    for clip in clips:
+        title = clip.get("title") or f"Clip {clip['id']}"
+        out = dvd_clips_dir / f"title_{clip['id']}.mpg"
+
+        dt = (
+            f"drawtext=text='{_esc_drawtext(title)}'"
+            f":fontcolor=white:fontsize=42"
+            f":x=(w-text_w)/2:y=(h-text_h)/2"
+        )
+        if font:
+            dt += f":fontfile='{font}'"
+
+        vf = (
+            f"{dt},"
+            f"fade=t=in:st=0:d={fade_duration},"
+            f"fade=t=out:st={fade_out_start}:d={fade_duration}"
+        )
+
+        ok, err = _run([
+            "ffmpeg", "-y",
+            "-f", "lavfi", "-i", f"color=c=black:s=720x480:r=29.97",
+            "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
+            "-vf", vf,
+            "-t", str(title_duration),
+            "-c:v", "mpeg2video", "-b:v", "5000k",
+            "-c:a", "ac3", "-ar", "48000",
+            "-shortest", str(out),
+        ])
+        if not ok:
+            return False, {}, err
+        paths[clip["id"]] = out
+
+    return True, paths, ""
+
+
 def _step6_dvdauthor_xml(
     project_name: str,
     clips: list[dict],
     output_dir: Path,
     dvd_clips_dir: Path,
     menu_final: Path,
+    title_card_paths: dict[str, Path] | None = None,
 ) -> Path:
-    """Write the dvdauthor XML file and return its path."""
+    """Write the dvdauthor XML file and return its path.
+
+    Each clip becomes one DVD chapter.  When title cards are present the
+    chapter marker sits on the title card VOB so that navigation lands on
+    the title first; the clip content VOB immediately follows with no
+    separate chapter marker.
+    """
     dvd_dir = output_dir / "dvd"
-    vobs = "\n".join(
-        f'        <vob file="{dvd_clips_dir / (c["id"] + ".mpg")}" chapters="0"/>'
-        for c in clips
-    )
+    vob_lines = []
+    for c in clips:
+        clip_file = dvd_clips_dir / (c["id"] + ".mpg")
+        if title_card_paths and c["id"] in title_card_paths:
+            vob_lines.append(
+                f'        <vob file="{title_card_paths[c["id"]]}" chapters="0"/>'
+            )
+            vob_lines.append(f'        <vob file="{clip_file}"/>')
+        else:
+            vob_lines.append(f'        <vob file="{clip_file}" chapters="0"/>')
+    vobs = "\n".join(vob_lines)
     xml = f"""<dvdauthor dest="{dvd_dir}">
   <vmgm>
     <menus>
@@ -255,6 +378,11 @@ def _step8_mkisofs(
 def publish_project(project_data: dict, project_dir: Path) -> tuple[bool, dict]:
     """Run the full DVD publishing pipeline.
 
+    Reads project_data["output_settings"] for transition configuration:
+      transition     : "none" | "fade" | "title"  (default "none")
+      fade_duration  : seconds for fade in/out     (default 0.5)
+      title_duration : seconds for title card      (default 3.0)
+
     Returns (True, {"iso_path": "..."}) on success.
     Returns (False, {"error": "...", "step": "...", "stderr": "..."}) on failure.
     """
@@ -265,11 +393,16 @@ def publish_project(project_data: dict, project_dir: Path) -> tuple[bool, dict]:
     if not clips:
         return False, {"error": "No clips to publish", "step": "validation", "stderr": ""}
 
-    clips_dir    = project_dir / "clips"
-    menu_dir     = project_dir / "menu"
-    output_dir   = project_dir / "output"
+    out_cfg       = project_data.get("output_settings", {})
+    transition    = out_cfg.get("transition", "none")
+    fade_duration = float(out_cfg.get("fade_duration", 0.5))
+    title_duration = float(out_cfg.get("title_duration", 3.0))
+
+    clips_dir     = project_dir / "clips"
+    menu_dir      = project_dir / "menu"
+    output_dir    = project_dir / "output"
     dvd_clips_dir = output_dir / "dvd_clips"
-    dvd_dir      = output_dir / "dvd"
+    dvd_dir       = output_dir / "dvd"
 
     menu_dir.mkdir(exist_ok=True)
     output_dir.mkdir(exist_ok=True)
@@ -284,7 +417,7 @@ def publish_project(project_data: dict, project_dir: Path) -> tuple[bool, dict]:
     if not ok:
         return False, {"error": "Failed to concatenate menu segments", "step": "concat_segments", "stderr": err}
 
-    # Step 3 (Pillow — no subprocess, cannot fail fatally)
+    # Step 3 (Pillow — cannot fail fatally)
     overlay = _step3_overlay_image(project_name, clips, menu_dir)
 
     # Step 4
@@ -292,13 +425,29 @@ def publish_project(project_data: dict, project_dir: Path) -> tuple[bool, dict]:
     if not ok:
         return False, {"error": "Failed to compose menu video", "step": "compose_menu", "stderr": err}
 
-    # Step 5
-    ok, _, err = _step5_encode_clips(clips, clips_dir, dvd_clips_dir)
+    # Step 5 — encode clips (with fades if requested)
+    apply_fade = transition in ("fade", "title")
+    ok, _, err = _step5_encode_clips(
+        clips, clips_dir, dvd_clips_dir,
+        fade_duration=fade_duration if apply_fade else 0.0,
+    )
     if not ok:
         return False, {"error": "Failed to encode clips to DVD format", "step": "encode_clips", "stderr": err}
 
+    # Step 5b — generate title cards if requested
+    title_card_paths = None
+    if transition == "title":
+        ok, title_card_paths, err = _step5b_generate_title_cards(
+            clips, dvd_clips_dir, title_duration, fade_duration,
+        )
+        if not ok:
+            return False, {"error": "Failed to generate title cards", "step": "title_cards", "stderr": err}
+
     # Step 6
-    xml_path = _step6_dvdauthor_xml(project_name, clips, output_dir, dvd_clips_dir, menu_final)
+    xml_path = _step6_dvdauthor_xml(
+        project_name, clips, output_dir, dvd_clips_dir, menu_final,
+        title_card_paths=title_card_paths,
+    )
 
     # Step 7
     ok, err = _step7_dvdauthor(xml_path, dvd_dir)

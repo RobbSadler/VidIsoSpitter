@@ -6,7 +6,7 @@ from pathlib import Path
 
 from flask import Flask, jsonify, render_template, request, send_file
 
-from modules.clips import delete_clip, list_clips, merge_clips, reorder_clips, update_clip_title
+from modules.clips import delete_clip, list_clips, merge_clips, reorder_clips, split_clip_at_time, update_clip_title
 from modules.publisher import publish_project
 from modules.splitter import split_project
 import utils
@@ -374,6 +374,26 @@ def merge_clip_next(project_name, clip_id):
     return jsonify(payload), status
 
 
+@app.route("/api/project/<project_name>/clips/<clip_id>/split_at", methods=["POST"])
+def split_clip(project_name, clip_id):
+    sanitized = sanitize_name(project_name)
+    project_data = load_project(sanitized)
+    if project_data is None:
+        return jsonify({"error": f"Project '{project_name}' not found"}), 404
+
+    body = request.get_json(silent=True) or {}
+    try:
+        at = float(body["at"])
+    except (KeyError, TypeError, ValueError):
+        return jsonify({"error": "'at' (seconds) is required and must be a number"}), 400
+
+    project_dir = utils.PROJECTS_DIR / sanitized
+    updated, payload, status = split_clip_at_time(project_data, project_dir, sanitized, clip_id, at)
+    if updated:
+        save_project(sanitized, updated)
+    return jsonify(payload), status
+
+
 @app.route("/api/project/<project_name>/clips/<clip_id>", methods=["DELETE"])
 def soft_delete_clip(project_name, clip_id):
     sanitized = sanitize_name(project_name)
@@ -420,6 +440,48 @@ def stream_clip(project_name, clip_id):
     if not clip_path.is_file():
         return jsonify({"error": "Clip file missing from disk"}), 404
     return send_file(clip_path, mimetype="video/mp4", conditional=True)
+
+
+# ---------------------------------------------------------------------------
+# GET /api/project/<project_name>  — project metadata (no clips array)
+# ---------------------------------------------------------------------------
+
+@app.route("/api/project/<project_name>", methods=["GET"])
+def get_project(project_name):
+    sanitized = sanitize_name(project_name)
+    project_data = load_project(sanitized)
+    if project_data is None:
+        return jsonify({"error": f"Project '{project_name}' not found"}), 404
+    # Return everything except the (potentially large) clips array
+    summary = {k: v for k, v in project_data.items() if k != "clips"}
+    summary["sanitized_name"] = sanitized
+    summary["clip_count"] = len([c for c in project_data.get("clips", []) if not c.get("deleted")])
+    return jsonify(summary), 200
+
+
+# ---------------------------------------------------------------------------
+# PATCH /api/project/<project_name>/output_settings
+# ---------------------------------------------------------------------------
+
+@app.route("/api/project/<project_name>/output_settings", methods=["PATCH"])
+def set_output_settings(project_name):
+    sanitized = sanitize_name(project_name)
+    project_data = load_project(sanitized)
+    if project_data is None:
+        return jsonify({"error": f"Project '{project_name}' not found"}), 404
+
+    body = request.get_json(silent=True) or {}
+    transition = body.get("transition", "none")
+    if transition not in ("none", "fade", "title"):
+        return jsonify({"error": "transition must be 'none', 'fade', or 'title'"}), 400
+
+    project_data["output_settings"] = {
+        "transition":     transition,
+        "fade_duration":  float(body.get("fade_duration", 0.5)),
+        "title_duration": float(body.get("title_duration", 3.0)),
+    }
+    save_project(sanitized, project_data)
+    return jsonify(project_data["output_settings"]), 200
 
 
 # ---------------------------------------------------------------------------

@@ -30,8 +30,9 @@ const firstrunBrowse    = document.getElementById('firstrun-browse-btn');
 const firstrunSave      = document.getElementById('firstrun-save-btn');
 const projectHeader = document.getElementById('project-header');
 const clipCount     = document.getElementById('clip-count');
-const splitBtn        = document.getElementById('split-btn');
-const closeBtn        = document.getElementById('close-btn');
+const splitBtn            = document.getElementById('split-btn');
+const outputSettingsBtn   = document.getElementById('output-settings-btn');
+const closeBtn            = document.getElementById('close-btn');
 const projectTitleEl  = document.getElementById('project-title');
 const projectTitleInput = document.getElementById('project-title-input');
 const projectDivider  = document.getElementById('project-divider');
@@ -284,9 +285,45 @@ function buildCard(clip, index) {
     stopActiveVideo();
   });
 
+  video.addEventListener('timeupdate', () => {
+    razorBtn.disabled = video.currentTime <= 0;
+  });
+
   // title row
   const meta = document.createElement('div');
   meta.className = 'clip-meta';
+
+  // ── Razor / split-at-playhead button ──
+  const razorBtn = document.createElement('button');
+  razorBtn.className = 'split-btn';
+  razorBtn.title = 'Split clip at playhead position';
+  razorBtn.textContent = '✂';
+  razorBtn.disabled = true;   // enabled once video has a non-zero position
+
+  function formatTs(secs) {
+    const h = Math.floor(secs / 3600);
+    const m = Math.floor((secs % 3600) / 60);
+    const s = Math.floor(secs % 60);
+    return h > 0
+      ? `${h}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`
+      : `${m}:${String(s).padStart(2,'0')}`;
+  }
+
+  razorBtn.addEventListener('click', async () => {
+    const t = video.currentTime;
+    if (!t) return;
+    if (!confirm(`Create split of clip at ${formatTs(t)}?`)) return;
+    razorBtn.disabled = true;
+    stopActiveVideo();
+    try {
+      await apiCall('POST', `/api/project/${currentProject}/clips/${clip.id}/split_at`, { at: t });
+      const data = await getClips(currentProject);
+      renderClips(data.clips);
+    } catch (err) {
+      showError(`Split failed: ${err.message}`);
+      razorBtn.disabled = false;
+    }
+  });
 
   const mergeBtn = document.createElement('button');
   mergeBtn.className = 'merge-btn';
@@ -353,13 +390,21 @@ function buildCard(clip, index) {
       .catch(err => showError(`Could not delete clip: ${err.message}`));
   });
 
-  meta.append(mergeBtn, delBtn, titleInput, savedLabel);
+  meta.append(razorBtn, mergeBtn, delBtn, titleInput, savedLabel);
   card.append(wrap, meta);
   return card;
 }
 
 // ── Render clips ──────────────────────────────────────────
 function renderClips(clips) {
+  // Tear down all existing video elements before replacing the DOM.
+  // Calling .load() after clearing src cancels any pending network requests.
+  stopActiveVideo();
+  clipGrid.querySelectorAll('video').forEach(v => {
+    v.pause();
+    v.removeAttribute('src');
+    v.load();
+  });
   clipGrid.innerHTML = '';
   clips.forEach((clip, i) => clipGrid.appendChild(buildCard(clip, i)));
   // Disable merge button on the last card — nothing to merge into
@@ -394,6 +439,65 @@ function showSourcePreview(filePath) {
   previewVideo.src = `/api/preview_source?path=${encoded}`;
   previewWrap.style.display = 'block';
 }
+
+// ── Output settings modal ─────────────────────────────────
+const outputOverlay     = document.getElementById('output-settings-overlay');
+const outputRadios      = document.querySelectorAll('input[name="transition"]');
+const outputDetail      = document.getElementById('output-detail');
+const titleDurField     = document.getElementById('title-dur-field');
+const selFadeDur        = document.getElementById('sel-fade-dur');
+const selTitleDur       = document.getElementById('sel-title-dur');
+const outputSaveBtn     = document.getElementById('output-settings-save');
+const outputCancelBtn   = document.getElementById('output-settings-cancel');
+
+function getSelectedTransition() {
+  return [...outputRadios].find(r => r.checked)?.value || 'none';
+}
+
+function updateOutputDetail() {
+  const t = getSelectedTransition();
+  outputDetail.classList.toggle('visible', t === 'fade' || t === 'title');
+  titleDurField.style.display = t === 'title' ? '' : 'none';
+  // Highlight selected label
+  document.querySelectorAll('.radio-group label').forEach(lbl => {
+    lbl.classList.toggle('selected', lbl.querySelector('input').checked);
+  });
+}
+
+outputRadios.forEach(r => r.addEventListener('change', updateOutputDetail));
+
+outputSettingsBtn.addEventListener('click', async () => {
+  let cfg = {};
+  try {
+    const proj = await apiCall('GET', `/api/project/${currentProject}`);
+    cfg = proj.output_settings || {};
+  } catch (_) {}
+  const t = cfg.transition || 'none';
+  outputRadios.forEach(r => { r.checked = r.value === t; });
+  selFadeDur.value  = String(cfg.fade_duration  ?? 0.5);
+  selTitleDur.value = String(cfg.title_duration ?? 3);
+  updateOutputDetail();
+  outputOverlay.classList.add('open');
+});
+
+outputCancelBtn.addEventListener('click', () => outputOverlay.classList.remove('open'));
+
+outputSaveBtn.addEventListener('click', async () => {
+  const body = {
+    transition:     getSelectedTransition(),
+    fade_duration:  parseFloat(selFadeDur.value),
+    title_duration: parseFloat(selTitleDur.value),
+  };
+  try {
+    await apiCall('PATCH', `/api/project/${currentProject}/output_settings`, body);
+    // Update cache so reopening the modal shows current values
+    const cached = allProjects.find(p => p.sanitized_name === currentProject);
+    if (cached) cached.output_settings = body;
+    outputOverlay.classList.remove('open');
+  } catch (err) {
+    showError(`Failed to save output settings: ${err.message}`);
+  }
+});
 
 // ── Settings ──────────────────────────────────────────────
 async function browseDir(targetInput) {

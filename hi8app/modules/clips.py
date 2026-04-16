@@ -9,6 +9,7 @@ errors are surfaced as (None, {"error": "..."}, status_code) tuples.
 import shutil
 import subprocess
 import tempfile
+import uuid
 from pathlib import Path
 
 from modules.splitter import _get_duration, generate_thumbnail
@@ -91,6 +92,90 @@ def delete_clip(
 
     target["deleted"] = True
     return project_data, {"deleted": True, "clip_id": clip_id}, 200
+
+
+def split_clip_at_time(
+    project_data: dict, project_dir: Path, sanitized_name: str,
+    clip_id: str, at: float,
+) -> tuple[dict | None, dict, int]:
+    """Split a clip at *at* seconds into two consecutive clips.
+
+    The original clip becomes part A (0 → at).
+    A new clip record is inserted immediately after it for part B (at → end).
+    Both clips get fresh thumbnails and the full order sequence is renumbered.
+    """
+    clips = project_data.get("clips", [])
+    target = next((c for c in clips if c["id"] == clip_id and not c.get("deleted")), None)
+    if target is None:
+        return None, {"error": f"Clip '{clip_id}' not found"}, 404
+
+    clips_dir  = project_dir / "clips"
+    thumbs_dir = project_dir / "thumbs"
+    src = clips_dir / target["filename"]
+
+    if not src.is_file():
+        return None, {"error": "Clip file not found on disk"}, 500
+
+    duration = _get_duration(src)
+    if at <= 0 or at >= duration:
+        return None, {
+            "error": f"Split point {at:.2f}s is outside the clip (duration {duration:.2f}s)"
+        }, 400
+
+    ext    = src.suffix.lower()
+    new_id = f"clip_{uuid.uuid4().hex[:8]}"
+    part_a = clips_dir / f"_split_a{ext}"
+    part_b = clips_dir / f"{new_id}{ext}"
+
+    # ── Part A: 0 → at ──────────────────────────────────────
+    r = subprocess.run(
+        ["ffmpeg", "-y", "-i", str(src), "-to", str(at), "-c", "copy", str(part_a)],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        part_a.unlink(missing_ok=True)
+        return None, {"error": "ffmpeg failed splitting part A", "stderr": r.stderr}, 500
+
+    # ── Part B: at → end ────────────────────────────────────
+    r = subprocess.run(
+        ["ffmpeg", "-y", "-i", str(src), "-ss", str(at), "-c", "copy", str(part_b)],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        part_a.unlink(missing_ok=True)
+        part_b.unlink(missing_ok=True)
+        return None, {"error": "ffmpeg failed splitting part B", "stderr": r.stderr}, 500
+
+    # Replace original file with part A
+    src.unlink()
+    part_a.rename(src)
+
+    # Update clip A metadata
+    target["duration_seconds"] = _get_duration(src)
+    generate_thumbnail(src, thumbs_dir / f"{clip_id}.jpg", target["duration_seconds"])
+
+    # Build clip B record with order just after clip A
+    dur_b = _get_duration(part_b)
+    generate_thumbnail(part_b, thumbs_dir / f"{new_id}.jpg", dur_b)
+    clip_b = {
+        "id":               new_id,
+        "filename":         part_b.name,
+        "duration_seconds": dur_b,
+        "title":            "",
+        "deleted":          False,
+        "order":            target["order"] + 0.5,   # fractional → sorts after A
+    }
+    clips.append(clip_b)
+
+    # Renumber all active clips by current sort order
+    active = sorted([c for c in clips if not c.get("deleted")], key=lambda c: c["order"])
+    for i, c in enumerate(active, start=1):
+        c["order"] = i
+
+    return project_data, {
+        "clip_a": _with_urls(target, sanitized_name),
+        "clip_b": _with_urls(clip_b, sanitized_name),
+    }, 200
 
 
 def merge_clips(
