@@ -746,8 +746,10 @@ publishBtn.addEventListener('click', async () => {
     appendLog('Creating ISO…');
     appendLog(`✅ Done! Output: ${result.iso_path || 'see output/ folder'}`);
   } catch (err) {
-    appendLog(`❌ Error: ${err.message}`);
-    showError(`Publish failed: ${err.message}`);
+    const step   = err.data?.step   ? ` [${err.data.step}]`  : '';
+    const stderr = err.data?.stderr ? `\n${err.data.stderr}` : '';
+    appendLog(`❌ Error${step}: ${err.message}${stderr}`);
+    showError(`Publish failed${step}: ${err.message}`);
     publishBtn.disabled = false;
     publishBtn.textContent = '🔴 Publish DVD';
   }

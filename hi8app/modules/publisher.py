@@ -14,6 +14,7 @@ Steps:
 """
 
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -57,6 +58,23 @@ def _clip_duration(path: Path) -> float:
 def _esc_drawtext(text: str) -> str:
     """Escape a string for use inside an FFmpeg drawtext filter value."""
     return text.replace("\\", "\\\\").replace("'", "\\'").replace(":", "\\:")
+
+
+def _dvd_video_args() -> list[str]:
+    """Return FFmpeg output args that produce dvdauthor-compliant MPEG-2.
+
+    Key additions over a plain mpeg2video encode:
+      -f dvd          — DVD program-stream muxer; sets correct SCR/PTS values
+      -maxrate/-bufsize — DVD spec VBV buffer (prevents SCR drift)
+      -bf 2           — two B-frames (standard for DVD MPEG-2)
+    """
+    return [
+        "-c:v", "mpeg2video",
+        "-b:v", "5000k", "-maxrate", "8000k", "-minrate", "0", "-bufsize", "1835008",
+        "-bf", "2",
+        "-c:a", "ac3", "-ar", "48000", "-ac", "2",
+        "-f", "dvd",
+    ]
 
 
 def _run(cmd: list[str], env: dict | None = None) -> tuple[bool, str]:
@@ -113,6 +131,7 @@ def _step1_menu_segments(
             "-t", "3",
             "-vf", "scale=720:480",
             "-r", "29.97",
+            *_dvd_video_args(),
             str(seg),
         ])
         if not ok:
@@ -170,15 +189,21 @@ def _step3_overlay_image(
 def _step4_compose_menu(
     bg: Path, overlay: Path, menu_dir: Path
 ) -> tuple[bool, Path, str]:
-    """Burn the overlay into the background and encode as DVD MPEG-2."""
+    """Burn the overlay into the background and encode as DVD MPEG-2.
+
+    A silent AC-3 audio track is always added from lavfi so that the menu
+    VOB is guaranteed to have an audio stream (dvdauthor requires it).
+    """
     final = menu_dir / "menu_final.mpg"
     ok, err = _run([
         "ffmpeg", "-y",
         "-i", str(bg),
         "-i", str(overlay),
-        "-filter_complex", "overlay=0:0",
-        "-c:v", "mpeg2video", "-b:v", "4000k",
-        "-c:a", "ac3", "-ar", "48000",
+        "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
+        "-filter_complex", "[0:v][1:v]overlay=0:0[v]",
+        "-map", "[v]",
+        "-map", "2:a",
+        *_dvd_video_args(),
         str(final),
     ])
     return ok, final, err
@@ -218,22 +243,21 @@ def _step5_encode_clips(
                 "ffmpeg", "-y", "-i", str(src),
                 "-vf", vf, "-af", af,
                 "-r", "29.97",
-                "-c:v", "mpeg2video", "-b:v", "5000k",
-                "-c:a", "ac3", "-ar", "48000",
+                *_dvd_video_args(),
                 str(dst),
             ])
         elif _is_mpeg2(src):
             ok, err = _run([
                 "ffmpeg", "-y", "-i", str(src),
                 "-c:v", "copy", "-c:a", "ac3", "-ar", "48000",
+                "-f", "dvd",
                 str(dst),
             ])
         else:
             ok, err = _run([
                 "ffmpeg", "-y", "-i", str(src),
                 "-vf", "scale=720:480", "-r", "29.97",
-                "-c:v", "mpeg2video", "-b:v", "5000k",
-                "-c:a", "ac3", "-ar", "48000",
+                *_dvd_video_args(),
                 str(dst),
             ])
         if not ok:
@@ -242,17 +266,36 @@ def _step5_encode_clips(
     return True, encoded, ""
 
 
+def _make_title_png(title: str, out_png: Path) -> None:
+    """Render a 720×480 title card PNG using Pillow (fallback when no font for drawtext)."""
+    img = Image.new("RGB", (720, 480), (0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    font_path = _find_font()
+    try:
+        font = ImageFont.truetype(font_path, 52) if font_path else ImageFont.load_default()
+    except OSError:
+        font = ImageFont.load_default()
+    # Centre the text
+    bbox = draw.textbbox((0, 0), title, font=font)
+    w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    draw.text(((720 - w) / 2, (480 - h) / 2), title, fill="white", font=font)
+    img.save(str(out_png))
+
+
 def _step5b_generate_title_cards(
     clips: list[dict],
     dvd_clips_dir: Path,
     title_duration: float = 3.0,
     fade_duration: float = 0.5,
 ) -> tuple[bool, dict[str, Path], str]:
-    """Generate a black title-card MPG for each clip using FFmpeg drawtext.
+    """Generate a black title-card MPG for each clip.
+
+    Tries FFmpeg drawtext first; falls back to a Pillow-rendered PNG if no
+    suitable font is found or drawtext fails.
 
     Returns (success, {clip_id: Path}, stderr_on_failure).
-    The chapter marker is placed on the title card, so DVD navigation lands
-    there first before the clip content plays.
+    The chapter marker is placed on the title card VOB so DVD navigation
+    lands on the title before the clip content plays.
     """
     dvd_clips_dir.mkdir(parents=True, exist_ok=True)
     font = _find_font()
@@ -263,6 +306,7 @@ def _step5b_generate_title_cards(
         title = clip.get("title") or f"Clip {clip['id']}"
         out = dvd_clips_dir / f"title_{clip['id']}.mpg"
 
+        # ── Try drawtext approach ────────────────────────────
         dt = (
             f"drawtext=text='{_esc_drawtext(title)}'"
             f":fontcolor=white:fontsize=42"
@@ -279,16 +323,37 @@ def _step5b_generate_title_cards(
 
         ok, err = _run([
             "ffmpeg", "-y",
-            "-f", "lavfi", "-i", f"color=c=black:s=720x480:r=29.97",
+            "-f", "lavfi", "-i", "color=c=black:s=720x480:r=29.97",
             "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
+            "-map", "0:v", "-map", "1:a",
             "-vf", vf,
             "-t", str(title_duration),
-            "-c:v", "mpeg2video", "-b:v", "5000k",
-            "-c:a", "ac3", "-ar", "48000",
+            *_dvd_video_args(),
             "-shortest", str(out),
         ])
+
         if not ok:
-            return False, {}, err
+            # ── Fallback: Pillow PNG → ffmpeg ────────────────
+            png = dvd_clips_dir / f"title_{clip['id']}.png"
+            _make_title_png(title, png)
+            fade_vf = (
+                f"fade=t=in:st=0:d={fade_duration},"
+                f"fade=t=out:st={fade_out_start}:d={fade_duration}"
+            )
+            ok, err = _run([
+                "ffmpeg", "-y",
+                "-loop", "1", "-framerate", "29.97", "-i", str(png),
+                "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
+                "-map", "0:v", "-map", "1:a",
+                "-vf", f"scale=720:480,{fade_vf}",
+                "-t", str(title_duration),
+                *_dvd_video_args(),
+                "-shortest", str(out),
+            ])
+            png.unlink(missing_ok=True)
+            if not ok:
+                return False, {}, err
+
         paths[clip["id"]] = out
 
     return True, paths, ""
@@ -325,7 +390,8 @@ def _step6_dvdauthor_xml(
   <vmgm>
     <menus>
       <pgc entry="title">
-        <vob file="{menu_final}" pause="inf"/>
+        <vob file="{menu_final}"/>
+        <post>jump titleset 1 title 1;</post>
       </pgc>
     </menus>
   </vmgm>
@@ -333,6 +399,7 @@ def _step6_dvdauthor_xml(
     <titles>
       <pgc>
 {vobs}
+        <post>call vmgm menu;</post>
       </pgc>
     </titles>
   </titleset>
@@ -343,16 +410,33 @@ def _step6_dvdauthor_xml(
 
 
 def _step7_dvdauthor(xml_path: Path, dvd_dir: Path) -> tuple[bool, str]:
-    """Run dvdauthor (structure pass + table-of-contents pass)."""
+    """Run dvdauthor (structure pass + table-of-contents pass).
+
+    dvdauthor often exits 0 while printing ERR: lines to stderr, so we
+    check for those explicitly.  We also verify that VIDEO_TS.IFO exists
+    and is non-empty after the first pass before proceeding to -T.
+    """
     dvd_dir.mkdir(parents=True, exist_ok=True)
     env = {"VIDEO_FORMAT": "NTSC"}
 
     ok, err = _run(["dvdauthor", "-o", str(dvd_dir), "-x", str(xml_path)], env=env)
     if not ok:
         return False, err
+    if "ERR:" in err:
+        return False, f"dvdauthor reported errors:\n{err}"
 
-    ok, err = _run(["dvdauthor", "-T", "-o", str(dvd_dir)], env=env)
-    return ok, err
+    ifo = dvd_dir / "VIDEO_TS" / "VIDEO_TS.IFO"
+    if not ifo.exists() or ifo.stat().st_size == 0:
+        return False, f"dvdauthor first pass produced no VIDEO_TS.IFO\n{err}"
+
+    ok, err2 = _run(["dvdauthor", "-T", "-o", str(dvd_dir)], env=env)
+    combined = "\n".join(filter(None, [err, err2]))
+    if not ok:
+        return False, combined
+    if "ERR:" in err2:
+        return False, f"dvdauthor -T reported errors:\n{combined}"
+
+    return True, combined
 
 
 def _step8_mkisofs(
@@ -403,6 +487,12 @@ def publish_project(project_data: dict, project_dir: Path) -> tuple[bool, dict]:
     output_dir    = project_dir / "output"
     dvd_clips_dir = output_dir / "dvd_clips"
     dvd_dir       = output_dir / "dvd"
+
+    # Wipe any artifacts from a previous (possibly failed) publish run so
+    # dvdauthor doesn't merge into a stale partial VIDEO_TS structure.
+    for stale in (dvd_dir, dvd_clips_dir):
+        if stale.exists():
+            shutil.rmtree(stale)
 
     menu_dir.mkdir(exist_ok=True)
     output_dir.mkdir(exist_ok=True)
